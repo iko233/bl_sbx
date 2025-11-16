@@ -75,6 +75,17 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
     """)
     conn.commit()
     conn.close()
+            
+    # Kill bookassetd and Books processes to stop them from updating BLDatabaseManager.sqlite
+    procs = OsTraceService(lockdown=service_provider).get_pid_list().get("Payload")
+    pid_bookassetd = next((pid for pid, p in procs.items() if p['ProcessName'] == 'bookassetd'), None)
+    pid_books = next((pid for pid, p in procs.items() if p['ProcessName'] == 'Books'), None)
+    if pid_bookassetd:
+        click.secho(f"Killing bookassetd pid {pid_bookassetd}...", fg="yellow")
+        pc.kill(pid_bookassetd)
+    if pid_books:
+        click.secho(f"Killing Books pid {pid_books}...", fg="yellow")
+        pc.kill(pid_books)
     
     # Upload com.apple.MobileGestalt.plist
     click.secho("Uploading com.apple.MobileGestalt.plist", fg="yellow")
@@ -107,6 +118,13 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
     if pid_books:
         click.secho(f"Killing Books pid {pid_books}...", fg="yellow")
         pc.kill(pid_books)
+    
+    # Re-open Books app
+    try:
+        pc.launch("com.apple.iBooks")
+    except Exception as e:
+        click.secho(f"Error launching Books app: {e}", fg="red")
+        return
 
 def _run_async_rsd_connection(address, port):
     async def async_connection():

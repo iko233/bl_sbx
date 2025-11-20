@@ -37,7 +37,7 @@ from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscove
 from pymobiledevice3.services.dvt.instruments.process_control import ProcessControl
 
 START_DISCLOSURE_PATH = "/var/mobile/Library/CallServices/Greetings/default/StartDisclosureWithTone.m4a"
-GLOBAL_TIMEOUT_SECONDS = 50
+GLOBAL_TIMEOUT_SECONDS = 500 #lol, forgot to change it
 
 
 def get_uuid_from_tracev2_after_reboot(service_provider: LockdownClient):

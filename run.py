@@ -384,7 +384,7 @@ async def connection_context(udid):# Create a LockdownClient instance
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: python run.py <udid> /path/to/StartDisclosureWithTone.m4a")
+        print("Usage: python run.py <udid> /path/to/iTunesMetadata.plist")
         exit(1)
     
     sd_file = sys.argv[2]
